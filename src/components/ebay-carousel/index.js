@@ -5,330 +5,219 @@ const processHtmlAttributes = require('../../common/html-attributes');
 const observer = require('../../common/property-observer');
 const template = require('./template.marko');
 
-const constants = {
-    types: {
-        discrete: 'discrete',
-        continuous: 'continuous'
-    },
-    margin: 16 // matches the css applied to each item
-};
-
 function getInitialState(input) {
-    let items = (input.items || []).map(item => ({
-        hidden: false,
-        htmlAttributes: processHtmlAttributes(item),
-        renderBody: item.renderBody
-    }));
-    const type = input.type || constants.types.continuous;
-    const isDiscrete = type === constants.types.discrete;
-    let itemsPerSlide;
-    let totalSlides;
-
-    if (isDiscrete) {
-        itemsPerSlide = parseInt(input.itemsPerSlide) || 1;
-        totalSlides = parseInt(items.length / itemsPerSlide);
-
-        // remove trailing items that don't fit equally in slides
-        items = items.filter((item, i) => i < totalSlides * itemsPerSlide);
-    }
-
-    return {
-        index: parseInt(input.index) || 0,
-        type,
-        isContinuous: type === constants.types.continuous,
-        isDiscrete,
-        itemsPerSlide,
-        totalSlides,
-        lastIndex: items.length - 1,
-        slide: parseInt(input.slide) || 1,
-        activeDot: isDiscrete && 1,
-        prevControlDisabled: true,
-        nextControlDisabled: false,
-        bothControlsDisabled: false,
+    const state = {
+        gap: input.gap || 16,
+        index: parseInt(input.index, 10) || 0,
+        classes: ['carousel',  input.class],
+        itemsPerSlide: parseInt(input.itemsPerSlide, 10) || undefined,
         accessibilityPrev: input.accessibilityPrev || 'Previous Slide',
         accessibilityNext: input.accessibilityNext || 'Next Slide',
         accessibilityStatus: input.accessibilityStatus || 'Showing Slide {currentSlide} of {totalSlides} - Carousel',
         accessibilityCurrent: input.accessibilityCurrent || 'Current Slide {currentSlide} - Carousel',
         accessibilityOther: input.accessibilityOther || 'Slide {slide} - Carousel',
-        classes: ['carousel', `carousel--${type}`, isDiscrete && `carousel--discrete-${itemsPerSlide}`, input.class],
-        translation: 0,
         htmlAttributes: processHtmlAttributes(input),
-        items
+        items: (input.items || []).map(item => ({
+            htmlAttributes: processHtmlAttributes(item),
+            renderBody: item.renderBody
+        }))
     };
-}
 
-function getTemplateData(state) {
-    if (state.isDiscrete) {
-        state.statusText = state.accessibilityStatus
-            .replace('{currentSlide}', state.slide)
-            .replace('{totalSlides}', state.totalSlides);
+    // Remove any extra items when using explicit itemsPerSlide.
+    const { items, itemsPerSlide } = state;
+    if (itemsPerSlide) {
+        items.length -= items.length % itemsPerSlide;
     }
+
     return state;
 }
 
+function getTemplateData(state) {
+    const { items, itemsPerSlide, slideWidth } = state;
+    const index = state.index - (itemsPerSlide ? state.index % itemsPerSlide : 0);
+    const maxOffset = items[items.length - 1].right - slideWidth;
+    const offset = Math.min(items[index].left, maxOffset);
+    const prevControlDisabled = offset === 0;
+    const nextControlDisabled = offset === maxOffset;
+    const bothControlsDisabled = prevControlDisabled && nextControlDisabled;
+    let slide, itemWidth, totalSlides, accessibilityStatus;
+
+    if (itemsPerSlide) {
+        slide = Math.ceil(index / itemsPerSlide);
+        itemWidth = `calc(${100 / itemsPerSlide}% - ${(itemsPerSlide - 1) * state.gap / itemsPerSlide}px)`;
+        totalSlides = Math.ceil(items.length / itemsPerSlide);
+        accessibilityStatus = state.accessibilityStatus
+            .replace('{currentSlide}', slide + 1)
+            .replace('{totalSlides}', totalSlides);
+    } else {
+        itemWidth = 'auto';
+    }
+
+    items.forEach(item => item.hidden = !isVisible(item, offset, slideWidth));
+
+    const data = Object.assign({}, state, {
+        items,
+        slide,
+        offset,
+        itemWidth,
+        totalSlides,
+        accessibilityStatus,
+        prevControlDisabled,
+        nextControlDisabled,
+        bothControlsDisabled
+    });
+
+    return data;
+}
+
 function init() {
-    this.itemCache = [];
-    this.listEl = this.el.querySelector('.carousel__list');
-    this.itemEls = this.listEl.children;
-    this.activeIndex = 0;
-    this.firstVisibleIndex = 0;
-    this.lastVisibleIndex = 0;
+    this.listEl = this.getEl('list');
+    this.containerEl = this.getEl('container');
+    this.subscribeTo(resizeUtil).on('resize', onRender.bind(this));
+    observer.observeRoot(this, ['index']);
 
-    const containerEl = this.el.querySelector('.carousel__container');
-    this.usesNativeScroll = window.getComputedStyle && window.getComputedStyle(containerEl)['overflow-x'] === 'scroll';
-    if (this.state.isDiscrete) {
-        observer.observeRoot(this, ['slide'], () => {
-            this.simulateDotClick(this.state.slide);
+    if (getComputedStyle(this.listEl).getPropertyValue('overflow-x') !== 'visible') {
+        this.setState('nativeScrolling', true);
+    } else {
+        this.subscribeTo(this.listEl).on('transitionend', () => {
+            const { state: { index, items, slideWidth } } = this;
+            const maxOffset = items[items.length - 1].right - slideWidth;
+            const offset = Math.min(items[index].left, maxOffset);
+            emitAndFire(this, 'carousel-update', {
+                visibleIndexes: items
+                    .filter(item => isVisible(item, offset, slideWidth))
+                    .map(item => items.indexOf(item))
+            });
         });
-    } else if (this.state.isContinuous) {
-        observer.observeRoot(this, ['index']);
     }
-
-    this.subscribeTo(resizeUtil).on('resize', refresh.bind(this));
-    this.refresh();
 }
 
-function onUpdate() {
-    this.processIndexChange();
-}
+function onRender() {
+    if (this.preserveItems) {
+        // Track if we are on a normal render or a render caused by recalculating.
+        this.preserveItems = false;
 
-function onDestroy() {
-    cancelAnimationFrame(this.processMovementFrame);
-}
+        // Ensure only visible items within the carousel are focusable.
+        // We don't have access to these items in the template so me must update manually.
+        forEls(this.listEl, itemEl => {
+            focusables(itemEl).forEach(itemEl.getAttribute('aria-hidden') !== 'true'
+                ? child => child.removeAttribute('tabindex')
+                : child => child.setAttribute('tabindex', '-1')
+            );
+        });
 
-function refresh() {
-    this.calculateWidths(true);
-    if (this.state.isDiscrete) {
-        this.simulateDotClick(this.state.slide);
-    }
-    this.processMovement();
-}
-
-/**
- * High level function called for movement upon changing index (via UI and API)
- * Exits early if there was no actual change to index
- */
-function processIndexChange() {
-    // TODO: API manipulation is disabled in native scroll case
-    if (this.usesNativeScroll) {
         return;
     }
+    
+    cancelAnimationFrame(this.renderFrame);
+    this.renderFrame = requestAnimationFrame(() => {
+        const { state: { items } } = this;
+        this.preserveItems = true;
+        this.setState('slideWidth', this.containerEl.offsetWidth);
 
-    if (this.state.index > this.state.lastIndex) {
-        this.setState('index', this.state.lastIndex);
-    }
-
-    if (this.containerWidth >= this.allItemsWidth || this.state.index < 0) {
-        this.setState('index', 0);
-    }
-
-    const sameIndex = this.state.index === this.activeIndex;
-    const isTranslated = (this.state.index === 0 && this.state.translation === 0) || this.state.translation !== 0;
-
-    if (sameIndex && isTranslated) {
-        return;
-    }
-
-    this.activeIndex = this.state.index;
-
-    this.processMovement();
-}
-
-/**
- * Handle movement to current state.index
- */
-function processMovement() {
-    cancelAnimationFrame(this.processMovementFrame);
-    this.processMovementFrame = requestAnimationFrame(() => {
-        const oldFirstVisibleIndex = this.firstVisibleIndex;
-        const oldLastVisibleIndex = this.lastVisibleIndex;
-        this.moveToIndex(this.state.index);
-        this.lastVisibleIndex = this.calculateLastVisibleIndex();
-        this.setState('prevControlDisabled', this.state.index === 0);
-        this.setState('nextControlDisabled', this.lastVisibleIndex === this.state.lastIndex);
-        this.setState('bothControlsDisabled', this.state.prevControlDisabled && this.state.nextControlDisabled);
-
-        // must calculate firstVisibleIndex after nextControlDisabled is set
-        this.firstVisibleIndex = this.calculateFirstVisibleIndex();
-
-        if (this.state.isDiscrete) {
-            this.setState('activeDot', (this.lastVisibleIndex + 1) / this.state.itemsPerSlide);
-        }
-
-        if (this.firstVisibleIndex !== oldFirstVisibleIndex ||
-            this.lastVisibleIndex !== oldLastVisibleIndex) {
-            const visibleIndexes = [];
-            for (let i = this.firstVisibleIndex; i <= this.lastVisibleIndex; i++) {
-                visibleIndexes.push(i);
-            }
-
-            emitAndFire(this, 'carousel-update', { visibleIndexes });
-        }
-
-        this.state.items.forEach((item, i) => {
-            item.hidden = (i < this.firstVisibleIndex || i > this.lastVisibleIndex);
-        });
-        this.setStateDirty('items');
-
-        // update nested focusable elements via DOM (we don't control this content)
-        // TODO: patch makeup-focusables to support more customized selectors?
-        const hiddenItems = this.el.querySelectorAll('.carousel__list > li[aria-hidden="true"]') || [];
-        const visibleItems = this.el.querySelectorAll('.carousel__list > li[aria-hidden="false"]') || [];
-        hiddenItems.forEach(hiddenItem => {
-            focusables(hiddenItem).forEach(focusable => focusable.setAttribute('tabindex', '-1'));
-        });
-        visibleItems.forEach(visibleItem => {
-            focusables(visibleItem).forEach(focusable => focusable.removeAttribute('tabindex'));
+        // Update item positions in the dom.
+        forEls(this.listEl, (itemEl, i) => {
+            const item = items[i++];
+            item.left = itemEl.offsetLeft;
+            item.right = item.left + itemEl.offsetWidth;
         });
     });
 }
 
+function onDestroy() {
+    cancelAnimationFrame(this.renderFrame);
+}
+
 /**
- * Move carousel position to an index
+ * Moves the carousel in the `data-direction` of the clicked element if possible.
+ *
+ * @param {MouseEvent} originalEvent 
+ * @param {HTMLElement} target 
  */
-function moveToIndex() {
-    let translation = -1 * this.getWidthBetweenIndexes(0, this.state.index);
-    const maxTranslation = -1 * (this.allItemsWidth - this.containerWidth);
-    if (translation !== 0 && translation < maxTranslation) {
-        translation = maxTranslation;
-    }
+function handleMove(originalEvent, target) {
+    const direction = parseInt(target.getAttribute('data-direction'), 10);
+    const newIndex = this.getNextIndex(direction);
 
-    if (translation !== this.state.translation) {
-        this.setState('translation', translation);
-        emitAndFire(this, 'carousel-move');
+    if (newIndex !== this.state.index) {
+        this.preserveItems = true;
+        this.setState('index', newIndex);
+        emitAndFire(this, `carousel-${direction === 1 ? 'next' : 'prev'}`, { originalEvent });
     }
 }
 
-function calculateNextIndex() {
-    return this.calculateLastVisibleIndex() + 1;
+/**
+ * Moves the carousel to the slide at `data-slide` for the clicked element if possible.
+ *
+ * @param {MouseEvent} originalEvent 
+ * @param {HTMLElement} target
+ */
+function handleDotClick(originalEvent, target) {
+    const { state: { index, itemsPerSlide } } = this;
+    const slide = parseInt(target.getAttribute('data-slide'), 10);
+    let selectedIndex = slide * itemsPerSlide;
+
+    if (index !== selectedIndex) {
+        this.preserveItems = true;
+        this.setState('index', selectedIndex);
+        emitAndFire(this, 'carousel-slide', { originalEvent });
+    }
 }
 
-function calculatePrevIndex() {
-    let index = this.state.index - 1;
+/**
+ * Calculates the next valid index.
+ *
+ * @param {-1|1} direction -1 for left and 1 for right.
+ * @return {number}
+ */
+function getNextIndex(direction) {
+    const { state: { index, items, slideWidth, itemsPerSlide } } = this;
+    let newIndex = index;
 
-    // check if we'll hit the left end
-    const widthBeforeCurrentIndex = this.getWidthBetweenIndexes(0, this.state.index);
-    if (widthBeforeCurrentIndex < this.containerWidth) {
-        return 0;
-    }
+    if (itemsPerSlide) {
+        newIndex += itemsPerSlide * direction;
+        newIndex = Math.min(newIndex, items.length - itemsPerSlide);
+        newIndex = Math.max(newIndex, 0);
+    } else {
+        const maxOffset = items[items.length - 1].right - slideWidth;
+        const offset = Math.min(items[index].left, maxOffset);
+        let item;
 
-    if (this.state.nextControlDisabled) {
-        index = this.calculateFirstVisibleIndex() - 1;
-    }
-
-    return this.widthLoop(index, -1) + 1;
-}
-
-function widthLoop(startIndex, direction) {
-    let index = startIndex;
-    let remainingWidth = this.containerWidth;
-
-    while (remainingWidth > 0) {
-        remainingWidth -= this.getItemWidth(index);
-        if (index > this.state.lastIndex || index < 0 || remainingWidth < 0) {
-            break;
+        while(item = items[newIndex + direction]) {
+            if (Math.abs(item.left - offset) > slideWidth) break;
+            newIndex += direction;
         }
-        remainingWidth -= constants.margin;
-        index += direction;
     }
 
-    return index;
-}
-
-function calculateFirstVisibleIndex() {
-    if (!this.state.nextControlDisabled) {
-        return this.state.index;
-    }
-
-    // if continuous carousel is all the way on right end, need to calculate manually
-    return this.widthLoop(this.state.lastIndex, -1) + 1;
-}
-
-function calculateLastVisibleIndex() {
-    return this.widthLoop(this.state.index, 1) - 1;
+    return newIndex;
 }
 
 /**
- * Get the aggregate width of all items in the carousel between these indexes.
- * Calculation is from left edge of item at startIndex item until left edge of item at endIndex
- * @param {Integer} startIndex
- * @param {Integer} endIndex
+ * Calculates if an item is currently visible.
+ *
+ * @param {{ left: number, right: number }} item The item to check.
+ * @param {number} offset The current offset.
+ * @param {number} slideWidth The current container width.
+ * @return {boolean}
  */
-function getWidthBetweenIndexes(startIndex, endIndex) {
-    let width = 0;
-    for (let i = startIndex; i < endIndex; i++) {
-        width += this.getItemWidth(i) + constants.margin;
-    }
-
-    // subtract trailing margin if we hit right end
-    if (endIndex > this.state.lastIndex) {
-        width -= constants.margin;
-    }
-
-    return width;
+function isVisible({ left, right }, offset, slideWidth) {
+    return (
+        left - offset >= 0 &&
+        right - offset <= slideWidth
+    );
 }
 
 /**
- * Calculate and store widths of container and items
- * @params {Boolean} forceUpdate: Updates the cache with new values
+ * Calls a function on each element within a parent element.
+ *
+ * @param {HTMLElement} parent The parent to walk through.
+ * @param {(el: HTMLElement, i: number) => any} fn The function to call.
  */
-function calculateWidths(forceUpdate) {
-    this.containerWidth = this.listEl.getBoundingClientRect().width;
-    for (let i = 0; i <= this.state.lastIndex; i++) {
-        this.getItemWidth(i, forceUpdate);
-    }
-    this.allItemsWidth = this.getWidthBetweenIndexes(0, this.state.lastIndex + 1);
-}
-
-/**
- * Get single item width based on index
- * @params {Integer} index: Index of the carousel item
- * @params {Boolean} forceUpdate: Trigger fetch update of cache values
- */
-function getItemWidth(index, forceUpdate) {
-    if (this.itemCache && this.itemCache[index] && !forceUpdate) {
-        return this.itemCache[index];
-    } else if (index >= 0 && index <= this.state.lastIndex) {
-        this.itemCache[index] = this.itemEls[index].getBoundingClientRect().width;
-        return this.itemCache[index];
-    }
-
-    return 0;
-}
-
-function handleNext(originalEvent) {
-    if (!this.state.nextControlDisabled) {
-        if (this.state.isDiscrete) {
-            this.simulateDotClick(this.state.slide + 1);
-        } else if (this.state.isContinuous) {
-            this.setState('index', this.calculateNextIndex());
-        }
-        emitAndFire(this, 'carousel-next', { originalEvent });
-    }
-}
-
-function handlePrev(originalEvent) {
-    if (!this.state.prevControlDisabled) {
-        if (this.state.isDiscrete) {
-            this.simulateDotClick(this.state.slide - 1);
-        } else if (this.state.isContinuous) {
-            this.setState('index', this.calculatePrevIndex());
-        }
-        emitAndFire(this, 'carousel-prev', { originalEvent });
-    }
-}
-
-// TODO: add carousel-dot event and remove simulated dot clicks
-function handleDotClick(e) {
-    const newSlide = parseInt(e.target.getAttribute('data-slide'));
-    emitAndFire(this, 'carousel-slide', { slide: newSlide });
-    this.setState('slide', newSlide);
-    this.setState('index', (this.state.itemsPerSlide * (newSlide - 1)));
-}
-
-function simulateDotClick(slide) {
-    if (slide >= 1 && slide <= this.state.totalSlides) {
-        this.el.querySelector(`[data-slide="${slide}"]`).click();
+function forEls(parent, fn) {
+    let i = 0;
+    let child = parent.firstElementChild;
+    while (child) {
+        fn(child, i++);
+        child = child.nextElementSibling;
     }
 }
 
@@ -337,24 +226,9 @@ module.exports = require('marko-widgets').defineComponent({
     getInitialState,
     getTemplateData,
     init,
-    onUpdate,
+    onRender,
     onDestroy,
-    refresh,
-    processIndexChange,
-    processMovement,
-    calculateNextIndex,
-    calculatePrevIndex,
-    moveToIndex,
-    widthLoop,
-    calculateFirstVisibleIndex,
-    calculateLastVisibleIndex,
-    getWidthBetweenIndexes,
-    calculateWidths,
-    getItemWidth,
-    handleNext,
-    handlePrev,
+    handleMove,
     handleDotClick,
-    simulateDotClick
+    getNextIndex
 });
-
-module.exports.privates = { constants };

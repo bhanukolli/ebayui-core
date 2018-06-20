@@ -1,48 +1,56 @@
 <div class=data.classes w-bind ${data.htmlAttributes}>
     <var statusId=("carousel-status-" + widget.id)/>
-    <div class=("carousel__container" + (data.bothControlsDisabled ? " carousel__container--controls-disabled" : ""))>
+    <div w-id="container" class=["carousel__container", data.bothControlsDisabled && "carousel__container--controls-disabled"]>
         <span
-            if(data.isDiscrete)
+            if(data.totalSlides >= 1)
             id=statusId
             class="clipped"
             role="status"
             aria-live="polite">
-            ${data.statusText}
+            ${data.accessibilityStatus}
         </span>
-        <button
-            class="carousel__control carousel__control--prev"
-            w-onclick="handlePrev"
+        <button class="carousel__control carousel__control--prev"
+            w-onclick="handleMove"
+            data-direction=-1
             aria-describedby=statusId
             aria-label=data.accessibilityPrev
-            aria-disabled=String(data.prevControlDisabled)>
+            aria-disabled=(data.prevControlDisabled && 'true')>
             <ebay-icon type="inline" name="chevron-left"/>
         </button>
-        <ul class="carousel__list" style=("transform: translateX(" + data.translation + "px)")>
-            <for(item in data.items | status-var=loop)>
+        <ul w-id="list"
+            class="carousel__list"
+            style={transform: !data.nativeScrolling && `translateX(-${data.offset}px)`}>
+            <for(index, item in data.items)>
                 <li ${item.htmlAttributes}
                     w-body=item.renderBody
-                    aria-hidden=String(item.hidden)/>
+                    aria-hidden=(item.hidden && 'true')
+                    w-preserve-body-if(widget.preserveItems)
+                    style={
+                        flexBasis: data.itemWidth,
+                        marginRight: index !== data.items.length && `${data.gap}px`
+                    }/>
             </for>
         </ul>
         <button
             class="carousel__control carousel__control--next"
-            w-onclick="handleNext"
+            w-onclick="handleMove"
+            data-direction=1
             aria-describedby=statusId
             aria-label=data.accessibilityNext
-            aria-disabled=String(data.nextControlDisabled)>
+            aria-disabled=(data.nextControlDisabled && 'true')>
             <ebay-icon type="inline" name="chevron-right"/>
         </button>
     </div>
-    <ul if(data.isDiscrete) class="carousel__dots" role="navigation">
-        <li for(i from 1 to data.totalSlides)>
+    <ul class="carousel__dots" role="navigation" if(data.totalSlides > 1)>
+        <li for(i from 0 to data.totalSlides - 1)>
             <button
-                class=(i === data.activeDot ? "carousel__dot--active" : "")
+                class={"carousel__dot--active": i === data.slide}
                 w-onclick="handleDotClick"
                 data-slide=i
                 aria-describedby=statusId
-                aria-label=(i === data.activeDot ?
-                    data.accessibilityCurrent.replace('{currentSlide}', i) :
-                    data.accessibilityOther.replace('{slide}', i))/>
+                aria-label=(i === data.slide ?
+                    data.accessibilityCurrent.replace('{currentSlide}', i + 1) :
+                    data.accessibilityOther.replace('{slide}', i + 1))/>
         </li>
     </ul>
 </div>
